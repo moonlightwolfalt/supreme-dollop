@@ -20,6 +20,7 @@ import argparse
 import json
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -335,12 +336,34 @@ def slugify(text):
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "mope-project"
 
 
+def open_with_retry(url, timeout=60, attempts=5, base_delay=5):
+    """urlopen that backs off exponentially on 429/5xx and network errors."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return urllib.request.urlopen(url, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            retryable = e.code == 429 or e.code >= 500
+            wait = base_delay * 2 ** (attempt - 1)
+            if e.code == 429 and e.headers.get("Retry-After", "").isdigit():
+                wait = max(wait, int(e.headers["Retry-After"]))
+            if not retryable or attempt == attempts:
+                raise
+            reason = f"HTTP {e.code}"
+        except (urllib.error.URLError, TimeoutError) as e:
+            if attempt == attempts:
+                raise
+            wait = base_delay * 2 ** (attempt - 1)
+            reason = str(e)
+        print(f"  {reason}; retry {attempt}/{attempts - 1} in {wait}s", file=sys.stderr)
+        time.sleep(wait)
+
+
 def fetch_snapshot(dest):
     """Download the Wayback capture nearest SNAPSHOT_DATE for private reference."""
     dest.mkdir(parents=True, exist_ok=True)
     api = f"https://archive.org/wayback/available?url=mope.io&timestamp={SNAPSHOT_DATE}"
     try:
-        with urllib.request.urlopen(api, timeout=30) as r:
+        with open_with_retry(api, timeout=30) as r:
             closest = json.load(r).get("archived_snapshots", {}).get("closest")
         if not closest:
             print("  no Wayback snapshot found", file=sys.stderr)
@@ -348,7 +371,7 @@ def fetch_snapshot(dest):
         ts = closest["timestamp"]
         print(f"  using capture {ts}")
         base = f"https://web.archive.org/web/{ts}id_/"
-        with urllib.request.urlopen(base + "https://mope.io/", timeout=60) as r:
+        with open_with_retry(base + "https://mope.io/") as r:
             html = r.read().decode("utf-8", "replace")
         (dest / "index.html").write_text(html)
         scripts = re.findall(r'<script[^>]+src="([^"]+)"', html)
@@ -356,7 +379,7 @@ def fetch_snapshot(dest):
             url = src if src.startswith("http") else "https://mope.io/" + src.lstrip("/")
             name = re.sub(r"[^A-Za-z0-9._-]", "_", url.split("//", 1)[-1].split("?")[0])
             try:
-                with urllib.request.urlopen(base + url, timeout=60) as r:
+                with open_with_retry(base + url) as r:
                     (dest / name).write_bytes(r.read())
                 print(f"  saved {name}")
             except (urllib.error.URLError, TimeoutError) as e:
